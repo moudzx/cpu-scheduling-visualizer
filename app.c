@@ -12,7 +12,7 @@ DrawRectangleLinesEx(r,1.5f,col);
 }
 
 #define MAX_PROC 12
-#define MAX_GANTT 1024
+#define MAX_GANTT 4096
 #define SW 1280
 #define SH 800
 
@@ -32,7 +32,7 @@ static Color C_ORANGE ={255,160,40,255};
 static Color PCOLS[12]={
 {0,210,255,255},{180,40,255,255},{255,80,160,255},{60,220,120,255},
 {255,160,40,255},{120,200,255,255},{220,100,255,255},{255,220,60,255},
-{80,255,180,255},{255,120,80,255},{100,160,255,255},{200,255,100,255}
+{80,255,180,255},{255,120,80,255},{100,160,255,100},{200,255,100,255}
 };
 
 static volatile int alarm_fired=0;
@@ -71,7 +71,12 @@ int arrival,burst,priority;
 int remaining,finish,waiting,turnaround;
 Color col;
 }Proc;
-typedef struct{int pid,start,end;}GSlot;
+
+typedef struct{
+    int pid;  
+    int start,end;
+    int is_interrupt; 
+}GSlot;
 
 static Proc procs[MAX_PROC];
 static int nproc=0;
@@ -83,54 +88,205 @@ static int anim_running=0,anim_done=0;
 static float anim_time=0,anim_speed=1.0f;
 static int rr_quantum=2;
 
+static int sjf_preemptive=0;
+static int prio_preemptive=0;
+
 typedef enum{FCFS=0,SJF=1,RR=2,PRIO=3}Algo;
 
-void add_gs(int pid,int s,int e){
-if(sched_n>0&&sched_full[sched_n-1].pid==pid){sched_full[sched_n-1].end=e;return;}
-if(sched_n>=MAX_GANTT)return;
-sched_full[sched_n++]=(GSlot){pid,s,e};
+void add_gs_idle(int s,int e){
+    if(sched_n>=MAX_GANTT)return;
+    sched_full[sched_n++]=(GSlot){-1,s,e,0};
 }
-int cmp_arr(const void*a,const void*b){return ((Proc*)a)->arrival-((Proc*)b)->arrival;}
+void add_gs(int pid,int s,int e,int intr){
+    if(!intr && sched_n>0 && sched_full[sched_n-1].pid==pid && !sched_full[sched_n-1].is_interrupt){
+        sched_full[sched_n-1].end=e;
+        return;
+    }
+    if(sched_n>=MAX_GANTT)return;
+    sched_full[sched_n++]=(GSlot){pid,s,e,intr};
+}
 
 void build_fcfs(void){
-int idx[MAX_PROC];for(int i=0;i<nproc;i++)idx[i]=i;
-for(int i=0;i<nproc-1;i++)for(int j=i+1;j<nproc;j++)if(procs[idx[i]].arrival>procs[idx[j]].arrival){int x=idx[i];idx[i]=idx[j];idx[j]=x;}
-int t=0;
-for(int ii=0;ii<nproc;ii++){int i=idx[ii];if(t<procs[i].arrival)t=procs[i].arrival;add_gs(i,t,t+procs[i].burst);t+=procs[i].burst;procs[i].finish=t;procs[i].turnaround=t-procs[i].arrival;procs[i].waiting=procs[i].turnaround-procs[i].burst;}
+    int idx[MAX_PROC];for(int i=0;i<nproc;i++)idx[i]=i;
+    for(int i=0;i<nproc-1;i++)for(int j=i+1;j<nproc;j++)
+        if(procs[idx[i]].arrival>procs[idx[j]].arrival){int x=idx[i];idx[i]=idx[j];idx[j]=x;}
+    int t=0;
+    for(int ii=0;ii<nproc;ii++){
+        int i=idx[ii];
+        if(t<procs[i].arrival){add_gs_idle(t,procs[i].arrival);t=procs[i].arrival;}
+        add_gs(i,t,t+procs[i].burst,0);
+        t+=procs[i].burst;
+        procs[i].finish=t;
+        procs[i].turnaround=t-procs[i].arrival;
+        procs[i].waiting=procs[i].turnaround-procs[i].burst;
+    }
 }
-void build_sjf(void){
-int done[MAX_PROC]={0};int t=0,fin=0;
-while(fin<nproc){int best=-1;for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<=t&&(best==-1||procs[i].burst<procs[best].burst))best=i;if(best==-1){t++;continue;}add_gs(best,t,t+procs[best].burst);t+=procs[best].burst;procs[best].finish=t;procs[best].turnaround=t-procs[best].arrival;procs[best].waiting=procs[best].turnaround-procs[best].burst;done[best]=1;fin++;}
+
+void build_sjf_np(void){
+    int done[MAX_PROC]={0};int t=0,fin=0;
+    while(fin<nproc){
+        int best=-1;
+        for(int i=0;i<nproc;i++)
+            if(!done[i]&&procs[i].arrival<=t&&(best==-1||procs[i].burst<procs[best].burst))best=i;
+        if(best==-1){
+            int nt=1<<30;
+            for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<nt)nt=procs[i].arrival;
+            add_gs_idle(t,nt);t=nt;continue;
+        }
+        add_gs(best,t,t+procs[best].burst,0);
+        t+=procs[best].burst;
+        procs[best].finish=t;procs[best].turnaround=t-procs[best].arrival;
+        procs[best].waiting=procs[best].turnaround-procs[best].burst;
+        done[best]=1;fin++;
+    }
 }
+
+void build_sjf_p(void){
+    int rem[MAX_PROC];
+    for(int i=0;i<nproc;i++)rem[i]=procs[i].burst;
+    int done[MAX_PROC]={0};
+    int t=0,fin=0,prev=-1;
+    int total=0;for(int i=0;i<nproc;i++)total+=procs[i].burst;
+    while(fin<nproc){
+        int best=-1;
+        for(int i=0;i<nproc;i++)
+            if(!done[i]&&procs[i].arrival<=t&&(best==-1||rem[i]<rem[best]))best=i;
+        if(best==-1){
+            if(prev!=-1){add_gs(prev,t-1,t,0);}
+            int nt=1<<30;
+            for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<nt)nt=procs[i].arrival;
+            add_gs_idle(t,nt);t=nt;prev=-1;continue;
+        }
+        int intr=(prev!=-1&&prev!=best)?1:0;
+        if(prev!=-1&&prev!=best){
+            if(sched_n>0)sched_full[sched_n-1].is_interrupt=1;
+        }
+        if(sched_n==0||sched_full[sched_n-1].pid!=best){
+            if(sched_n>=MAX_GANTT)break;
+            sched_full[sched_n++]=(GSlot){best,t,t+1,0};
+        } else {
+            sched_full[sched_n-1].end=t+1;
+        }
+        rem[best]--;t++;prev=best;
+        if(rem[best]==0){
+            procs[best].finish=t;
+            procs[best].turnaround=t-procs[best].arrival;
+            procs[best].waiting=procs[best].turnaround-procs[best].burst;
+            done[best]=1;fin++;prev=-1;
+        }
+    }
+}
+
 void build_rr(int q){
-int rem[MAX_PROC];for(int i=0;i<nproc;i++)rem[i]=procs[i].burst;
-int queue[MAX_GANTT*4],qh=0,qt=0,inq[MAX_PROC]={0};
-int idx[MAX_PROC];for(int i=0;i<nproc;i++)idx[i]=i;
-for(int i=0;i<nproc-1;i++)for(int j=i+1;j<nproc;j++)if(procs[idx[i]].arrival>procs[idx[j]].arrival){int x=idx[i];idx[i]=idx[j];idx[j]=x;}
-int t=0,fin=0;
-for(int i=0;i<nproc;i++)if(procs[idx[i]].arrival==0){queue[qt++]=idx[i];inq[idx[i]]=1;}
-while(fin<nproc){
-if(qh==qt){t++;for(int i=0;i<nproc;i++)if(!inq[i]&&rem[i]>0&&procs[i].arrival<=t){queue[qt++]=i;inq[i]=1;}continue;}
-int cur=queue[qh++];int run=rem[cur]<q?rem[cur]:q;
-add_gs(cur,t,t+run);t+=run;rem[cur]-=run;
-for(int i=0;i<nproc;i++)if(!inq[i]&&rem[i]>0&&procs[i].arrival<=t){queue[qt++]=i;inq[i]=1;}
-if(rem[cur]==0){procs[cur].finish=t;procs[cur].turnaround=t-procs[cur].arrival;procs[cur].waiting=procs[cur].turnaround-procs[cur].burst;fin++;}
-else queue[qt++]=cur;
+    int rem[MAX_PROC];for(int i=0;i<nproc;i++)rem[i]=procs[i].burst;
+    /* sort by arrival */
+    int ord[MAX_PROC];for(int i=0;i<nproc;i++)ord[i]=i;
+    for(int i=0;i<nproc-1;i++)for(int j=i+1;j<nproc;j++)
+        if(procs[ord[i]].arrival>procs[ord[j]].arrival){int x=ord[i];ord[i]=ord[j];ord[j]=x;}
+
+    int queue[MAX_GANTT*4],qh=0,qt=0;
+    int inq[MAX_PROC]={0};
+    int t=0,fin=0;
+
+    for(int i=0;i<nproc;i++)
+        if(procs[ord[i]].arrival==0){queue[qt++]=ord[i];inq[ord[i]]=1;}
+
+    while(fin<nproc){
+        if(qh==qt){
+            int nt=1<<30;
+            for(int i=0;i<nproc;i++)if(!inq[i]&&rem[i]>0&&procs[i].arrival<nt)nt=procs[i].arrival;
+            if(nt==1<<30)break;
+            add_gs_idle(t,nt);t=nt;
+            for(int i=0;i<nproc;i++)
+                if(!inq[i]&&rem[i]>0&&procs[i].arrival<=t){queue[qt++]=i;inq[i]=1;}
+            continue;
+        }
+        int cur=queue[qh++];
+        int run=rem[cur]<q?rem[cur]:q;
+        int preempted=(rem[cur]>q);
+        add_gs(cur,t,t+run,preempted);
+        t+=run;rem[cur]-=run;
+        for(int i=0;i<nproc;i++)
+            if(!inq[i]&&rem[i]>0&&procs[i].arrival<=t){queue[qt++]=i;inq[i]=1;}
+        if(rem[cur]==0){
+            procs[cur].finish=t;
+            procs[cur].turnaround=t-procs[cur].arrival;
+            procs[cur].waiting=procs[cur].turnaround-procs[cur].burst;
+            fin++;
+        } else {
+            queue[qt++]=cur;
+        }
+    }
 }
+
+void build_prio_np(void){
+    int done[MAX_PROC]={0};int t=0,fin=0;
+    while(fin<nproc){
+        int best=-1;
+        for(int i=0;i<nproc;i++)
+            if(!done[i]&&procs[i].arrival<=t&&(best==-1||procs[i].priority<procs[best].priority))best=i;
+        if(best==-1){
+            int nt=1<<30;
+            for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<nt)nt=procs[i].arrival;
+            add_gs_idle(t,nt);t=nt;continue;
+        }
+        add_gs(best,t,t+procs[best].burst,0);
+        t+=procs[best].burst;
+        procs[best].finish=t;procs[best].turnaround=t-procs[best].arrival;
+        procs[best].waiting=procs[best].turnaround-procs[best].burst;
+        done[best]=1;fin++;
+    }
 }
-void build_prio(void){
-int done[MAX_PROC]={0};int t=0,fin=0;
-while(fin<nproc){int best=-1;for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<=t&&(best==-1||procs[i].priority<procs[best].priority))best=i;if(best==-1){t++;continue;}add_gs(best,t,t+procs[best].burst);t+=procs[best].burst;procs[best].finish=t;procs[best].turnaround=t-procs[best].arrival;procs[best].waiting=procs[best].turnaround-procs[best].burst;done[best]=1;fin++;}
+
+void build_prio_p(void){
+    int rem[MAX_PROC];
+    for(int i=0;i<nproc;i++)rem[i]=procs[i].burst;
+    int done[MAX_PROC]={0};
+    int t=0,fin=0,prev=-1;
+    int total=0;for(int i=0;i<nproc;i++)total+=procs[i].burst;
+    (void)total;
+    while(fin<nproc){
+        int best=-1;
+        for(int i=0;i<nproc;i++)
+            if(!done[i]&&procs[i].arrival<=t&&(best==-1||procs[i].priority<procs[best].priority))best=i;
+        if(best==-1){
+            if(prev!=-1&&sched_n>0)sched_full[sched_n-1].is_interrupt=0;
+            int nt=1<<30;
+            for(int i=0;i<nproc;i++)if(!done[i]&&procs[i].arrival<nt)nt=procs[i].arrival;
+            add_gs_idle(t,nt);t=nt;prev=-1;continue;
+        }
+        if(prev!=-1&&prev!=best&&sched_n>0)
+            sched_full[sched_n-1].is_interrupt=1;
+        if(sched_n==0||sched_full[sched_n-1].pid!=best){
+            if(sched_n>=MAX_GANTT)break;
+            sched_full[sched_n++]=(GSlot){best,t,t+1,0};
+        } else {
+            sched_full[sched_n-1].end=t+1;
+        }
+        rem[best]--;t++;prev=best;
+        if(rem[best]==0){
+            procs[best].finish=t;
+            procs[best].turnaround=t-procs[best].arrival;
+            procs[best].waiting=procs[best].turnaround-procs[best].burst;
+            done[best]=1;fin++;prev=-1;
+        }
+    }
 }
 
 void run_schedule(Algo algo){
-for(int i=0;i<nproc;i++){procs[i].remaining=procs[i].burst;procs[i].finish=procs[i].waiting=procs[i].turnaround=0;}
-sched_n=0;avg_wait=0;avg_tat=0;
-switch(algo){case FCFS:build_fcfs();break;case SJF:build_sjf();break;case RR:build_rr(rr_quantum);break;case PRIO:build_prio();break;}
-float sw=0,st=0;for(int i=0;i<nproc;i++){sw+=procs[i].waiting;st+=procs[i].turnaround;}
-avg_wait=sw/nproc;avg_tat=st/nproc;
-sched_total_time=sched_n?sched_full[sched_n-1].end:0;
-anim_time=0;anim_running=0;anim_done=0;
+    for(int i=0;i<nproc;i++){procs[i].remaining=procs[i].burst;procs[i].finish=procs[i].waiting=procs[i].turnaround=0;}
+    sched_n=0;avg_wait=0;avg_tat=0;
+    switch(algo){
+        case FCFS: build_fcfs(); break;
+        case SJF:  sjf_preemptive?build_sjf_p():build_sjf_np(); break;
+        case RR:   build_rr(rr_quantum); break;
+        case PRIO: prio_preemptive?build_prio_p():build_prio_np(); break;
+    }
+    float sw=0,st=0;
+    for(int i=0;i<nproc;i++){sw+=procs[i].waiting;st+=procs[i].turnaround;}
+    avg_wait=sw/nproc;avg_tat=st/nproc;
+    sched_total_time=sched_n?sched_full[sched_n-1].end:0;
+    anim_time=0;anim_running=0;anim_done=0;
 }
 
 typedef struct{char buf[32];int len;int active;}Field;
@@ -169,6 +325,16 @@ DrawRectangleRounded(r,0.3f,6,bg);
 RRL(r,0.3f,6,bdr);
 int tw=MeasureText(lbl,14);
 DrawText(lbl,(int)(r.x+(r.width-tw)/2),(int)(r.y+(r.height-14)/2),14,tc);
+}
+
+void draw_toggle(Rectangle r,const char*lbl,int on){
+    Color bg=on?(Color){20,80,20,255}:(Color){60,10,10,255};
+    Color bdr=on?C_GREEN:C_RED;
+    Color tc=on?C_GREEN:C_RED;
+    DrawRectangleRounded(r,0.4f,6,bg);
+    RRL(r,0.4f,6,bdr);
+    int tw=MeasureText(lbl,12);
+    DrawText(lbl,(int)(r.x+(r.width-tw)/2),(int)(r.y+(r.height-12)/2),12,tc);
 }
 
 typedef enum{TAB_TIMER=0,TAB_SCHED=1}Tab;
@@ -256,17 +422,52 @@ if(timer_running){char rs[32];sprintf(rs,"Running... %ds left",timer_remaining);
 if(tab==TAB_SCHED){
 draw_panel((Rectangle){8,58,390,SH-66},0.05f);
 
-const char*an[]={"FCFS","SJF","RR","PRIO"};
-for(int i=0;i<4;i++){Rectangle ab={16+(float)i*92,64,86,26};draw_btn(ab,an[i],algo==i,hov(ab));if(clicked(ab)){algo=i;sched_ran=0;anim_running=0;anim_done=0;anim_time=0;}}
-if(algo==RR){DrawText("Q:",16,98,13,C_GRAY);Rectangle qr={36,94,40,22};field_update(&quantum_fld,qr,0);field_draw(&quantum_fld,qr,"2");rr_quantum=fint(&quantum_fld);if(rr_quantum<1)rr_quantum=1;}
+const char*an[]={"FCFS","SJF","RR","Priority"};
+for(int i=0;i<4;i++){
+    Rectangle ab={16+(float)i*92,64,86,26};
+    draw_btn(ab,an[i],algo==i,hov(ab));
+    if(clicked(ab)){algo=i;sched_ran=0;anim_running=0;anim_done=0;anim_time=0;}
+}
 
-int hy=120;
+int extra_y=96;
+
+if(algo==SJF){
+    DrawText("Mode:",16,extra_y+2,12,C_GRAY);
+    Rectangle rnp={60,extra_y,58,20};
+    Rectangle rp ={124,extra_y,78,20};
+    draw_toggle(rnp,"Non-Preempt",!sjf_preemptive);
+    draw_toggle(rp, "Preemptive (SRTF)", sjf_preemptive);
+    if(clicked(rnp)&&sjf_preemptive){sjf_preemptive=0;sched_ran=0;anim_time=0;anim_running=0;anim_done=0;}
+    if(clicked(rp) &&!sjf_preemptive){sjf_preemptive=1;sched_ran=0;anim_time=0;anim_running=0;anim_done=0;}
+    extra_y+=26;
+}
+if(algo==PRIO){
+    DrawText("Mode:",16,extra_y+2,12,C_GRAY);
+    Rectangle rnp={60,extra_y,58,20};
+    Rectangle rp ={124,extra_y,78,20};
+    draw_toggle(rnp,"Non-Preempt",!prio_preemptive);
+    draw_toggle(rp, "Preemptive", prio_preemptive);
+    if(clicked(rnp)&&prio_preemptive){prio_preemptive=0;sched_ran=0;anim_time=0;anim_running=0;anim_done=0;}
+    if(clicked(rp) &&!prio_preemptive){prio_preemptive=1;sched_ran=0;anim_time=0;anim_running=0;anim_done=0;}
+    extra_y+=26;
+}
+if(algo==RR){
+    DrawText("Q:",16,extra_y+2,12,C_GRAY);
+    Rectangle qr={36,extra_y,40,22};
+    field_update(&quantum_fld,qr,0);
+    field_draw(&quantum_fld,qr,"2");
+    rr_quantum=fint(&quantum_fld);
+    if(rr_quantum<1)rr_quantum=1;
+    extra_y+=28;
+}
+
+int hy=extra_y+6;
 DrawText("Name",22,hy,12,C_GRAY);DrawText("Arr",78,hy,12,C_GRAY);
 DrawText("Burst",130,hy,12,C_GRAY);DrawText("Prio",190,hy,12,C_GRAY);
 DrawLine(14,hy+16,396,hy+16,(Color){40,20,70,255});
 
 for(int i=0;i<nproc;i++){
-int ry=140+i*34;
+int ry=hy+20+i*34;
 DrawRectangle(14,ry-2,380,30,i%2==0?(Color){20,12,38,255}:(Color){16,10,30,255});
 DrawCircle(26,ry+12,5,procs[i].col);
 Rectangle fn={36,ry+2,48,22};field_update(&fld[i][3],fn,1);field_draw(&fld[i][3],fn,"P?");
@@ -285,10 +486,10 @@ procs[i].priority=fint(&fld[i][2]);if(procs[i].priority<1)procs[i].priority=1;
 procs[i].col=PCOLS[i%12];
 }
 
-int add_y=140+nproc*34+4;
+int add_y=hy+20+nproc*34+4;
 if(nproc<MAX_PROC){
-Rectangle ab={16,add_y,120,24};draw_btn(ab,"+ Add Process",0,hov(ab));
-if(clicked(ab)){
+Rectangle ab2={16,add_y,120,24};draw_btn(ab2,"+ Add Process",0,hov(ab2));
+if(clicked(ab2)){
 int i=nproc++;
 snprintf(procs[i].name,8,"P%d",i+1);
 procs[i].arrival=0;procs[i].burst=3;procs[i].priority=1;procs[i].remaining=3;procs[i].col=PCOLS[i%12];
@@ -316,7 +517,13 @@ DrawText("Speed:",14,btn_y+42,12,C_GRAY);
 float speeds[]={0.5f,1.0f,2.0f,4.0f,8.0f};const char*slbl[]={"0.5x","1x","2x","4x","8x"};
 for(int i=0;i<5;i++){Rectangle sr={62+(float)i*60,btn_y+38,54,22};draw_btn(sr,slbl[i],anim_speed==speeds[i],hov(sr));if(clicked(sr))anim_speed=speeds[i];}
 }
-const char*desc[4]={"Non-preemptive. Ordered by arrival.","Non-preemptive. Shortest burst first.","Preemptive. Rotates with time quantum.","Non-preemptive. Lowest number = highest priority."};
+
+const char*desc[4]={
+    "Non-preemptive. Ordered by arrival.",
+    sjf_preemptive?"Preemptive (SRTF). Preempts on shorter arrival.":"Non-preemptive. Shortest burst first.",
+    "Preemptive. Rotates with time quantum. Idle gaps and interrupts shown.",
+    prio_preemptive?"Preemptive Priority. Lower number = higher priority.":"Non-preemptive Priority. Lower number = higher priority."
+};
 DrawText(desc[algo],14,SH-32,11,C_GRAY);
 
 int rx=404,rw=SW-rx-8;
@@ -327,12 +534,17 @@ const char*h="Set up processes and press Run.";int tw=MeasureText(h,15);DrawText
 }else{
 
 char tstr[32];snprintf(tstr,32,"t = %d / %d",(int)anim_time,sched_total_time);
-int tw=MeasureText(tstr,20);DrawText(tstr,rx+rw-tw-10,64,20,C_ACCENT);
+int tw2=MeasureText(tstr,20);DrawText(tstr,rx+rw-tw2-10,64,20,C_ACCENT);
+
+DrawRectangle(rx+10,66,14,12,(Color){40,40,40,200});
+DrawText("Idle",rx+28,66,11,C_GRAY);
+DrawLine(rx+70,66,rx+70,78,C_RED);
+DrawText("Interrupt",rx+74,66,11,C_RED);
 
 int bar_lbl=38;
 int bax=rx+10+bar_lbl;
 int baw=rw-bar_lbl-20;
-int bay_start=82;
+int bay_start=86;
 int row_h=34,bar_h=22;
 float ppt=(float)baw/(float)(sched_total_time>0?sched_total_time:1);
 
@@ -375,30 +587,53 @@ float vis=ge<anim_time?ge:anim_time;
 if(vis<=gs)continue;
 int sx=bax+(int)(gs*ppt);
 int sw2=(int)((vis-gs)*ppt);if(sw2<1)sw2=1;
-Color fc=procs[i].col;
-DrawRectangle(sx,ry,sw2,bar_h,fc);
+DrawRectangle(sx,ry,sw2,bar_h,procs[i].col);
 if(anim_time>=gs&&anim_time<ge){
 int gx=bax+(int)(anim_time*ppt)-2;
 DrawRectangle(gx,ry,5,bar_h,(Color){255,255,255,160});
 }
 char bl[8];snprintf(bl,8,"%s",procs[i].name);int blw=MeasureText(bl,11);
 if(sw2>blw+4)DrawText(bl,sx+(sw2-blw)/2,ry+(bar_h-11)/2,11,(Color){10,10,30,255});
+if(sched_full[s].is_interrupt&&vis>=ge){
+int ix=bax+(int)(ge*ppt);
+DrawLine(ix,ry,ix,ry+bar_h,C_RED);
+DrawTriangle((Vector2){ix-4,ry},(Vector2){ix+4,ry},(Vector2){ix,ry+7},C_RED);
+}
 }
 DrawRectangleLines(bax,ry,baw,bar_h,(Color){40,20,70,255});
 
 if(procs[i].finish>0&&(float)procs[i].finish<=anim_time){
-DrawText("✓",rx+12+MeasureText(procs[i].name,13)+4,ry+4,13,C_GREEN);
+DrawText("v",rx+12+MeasureText(procs[i].name,13)+4,ry+4,13,C_GREEN);
 }
 }
 
 {
-int cx=bax+(int)(anim_time*ppt);
-int top=bay_start;int bot=bay_start+10+nproc*row_h;
-DrawLine(cx,top,cx,bot,(Color){255,50,50,200});
-DrawTriangle((Vector2){cx-5,top},(Vector2){cx+5,top},(Vector2){cx,top+8},C_RED);
+int ry_idle=bay_start+10+nproc*row_h;
+DrawText("Idle",rx+12,ry_idle+4,11,C_GRAY);
+DrawRectangle(bax,ry_idle,baw,14,(Color){20,12,38,255});
+for(int s=0;s<sched_n;s++){
+if(sched_full[s].pid!=-1)continue;
+float gs=(float)sched_full[s].start,ge=(float)sched_full[s].end;
+float vis=ge<anim_time?ge:anim_time;
+if(vis<=gs)continue;
+int ix2=bax+(int)(gs*ppt);
+int iw=(int)((vis-gs)*ppt);if(iw<1)iw=1;
+DrawRectangle(ix2,ry_idle,iw,14,(Color){35,35,35,220});
+for(int xx=ix2;xx<ix2+iw;xx+=6)
+    DrawLine(xx,ry_idle,xx+4,ry_idle+14,(Color){80,80,80,160});
+DrawRectangleLines(ix2,ry_idle,iw,14,C_GRAY);
+}
+DrawRectangleLines(bax,ry_idle,baw,14,(Color){40,20,70,255});
 }
 
-int gy=bay_start+14+nproc*row_h;
+{
+int cx=bax+(int)(anim_time*ppt);
+int top2=bay_start;int bot2=bay_start+10+(nproc+1)*row_h;
+DrawLine(cx,top2,cx,bot2,(Color){255,50,50,200});
+DrawTriangle((Vector2){cx-5,top2},(Vector2){cx+5,top2},(Vector2){cx,top2+8},C_RED);
+}
+
+int gy=bay_start+14+(nproc+1)*row_h;
 DrawLine(rx,gy,rx+rw,gy,(Color){40,20,70,255});
 DrawText("Gantt:",rx+12,gy+6,12,C_GRAY);
 int gh=28,gya=gy+22;
@@ -408,10 +643,24 @@ float vis=ge<anim_time?ge:anim_time;
 if(vis<=gs)continue;
 int gx=bax+(int)(gs*ppt);
 int gw=(int)((vis-gs)*ppt);if(gw<1)gw=1;
-int pid=sched_full[s].pid;
-DrawRectangle(gx,gya,gw,gh,procs[pid].col);
-char lbl[8];snprintf(lbl,8,"%s",procs[pid].name);int lw=MeasureText(lbl,10);
+int pid2=sched_full[s].pid;
+if(pid2==-1){
+DrawRectangle(gx,gya,gw,gh,(Color){35,35,35,220});
+for(int xx=gx;xx<gx+gw;xx+=6)
+    DrawLine(xx,gya,xx+4,gya+gh,(Color){80,80,80,160});
+DrawRectangleLines(gx,gya,gw,gh,C_GRAY);
+char il[4]="---";int ilw=MeasureText(il,9);
+if(gw>ilw+2)DrawText(il,gx+(gw-ilw)/2,gya+(gh-9)/2,9,C_GRAY);
+} else {
+DrawRectangle(gx,gya,gw,gh,procs[pid2].col);
+char lbl[8];snprintf(lbl,8,"%s",procs[pid2].name);int lw=MeasureText(lbl,10);
 if(gw>lw+2)DrawText(lbl,gx+(gw-lw)/2,gya+(gh-10)/2,10,(Color){10,10,30,255});
+if(sched_full[s].is_interrupt&&vis>=ge){
+int ix3=gx+(int)(ge*ppt);(void)ix3;
+int ixx=gx+gw;
+DrawLine(ixx,gya,ixx,gya+gh,C_RED);
+}
+}
 }
 DrawRectangleLines(bax,gya,baw,gh,(Color){40,20,70,255});
 
