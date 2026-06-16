@@ -6,9 +6,9 @@
 Supports multiple scheduling algorithms:
 
 - FCFS (First Come First Serve)
-- SJF (Shortest Job First)
+- SJF (Shortest Job First) / Preemptive and Non Preemptive
 - Round Robin
-- Priority Scheduling
+- Priority Scheduling / Preemptive and Non Preemptive
 
 For each algorithm the application provides:
 
@@ -29,7 +29,11 @@ For each algorithm the application provides:
 - Per-process execution timeline
 
 #
-<img width="1282" height="760" alt="cc4" src="https://github.com/user-attachments/assets/e95c179b-b093-41d3-9302-d53fdf3f632a" />
+
+
+https://github.com/user-attachments/assets/8a939f1d-e86b-4df9-b31c-7ac915381471
+
+
 
 ### Countdown Timer
 
