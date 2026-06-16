@@ -80,6 +80,8 @@ make -j4 && make install
 
 <code>gcc app.c -o app   -I$HOME/raylib-install/include   -L$HOME/raylib-install/lib   -lraylib -lm -lpthread -ldl -lGL -lX11 -lXrandr -lXi -lXinerama -lXcursor && ./app</code>
 
+or run: <code>bash compilation.sh</code>
+
 ## Initial storyboard
 
 [Priority CPU-Scheduling.pptx](https://github.com/user-attachments/files/28986872/Priority.CPU-Scheduling.pptx)
